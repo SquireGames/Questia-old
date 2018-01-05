@@ -7,7 +7,7 @@ set(PROJ_NAME "qeng")
 downloadProject(
     PROJECT ${PROJ_NAME}
     REPOSITORY https://github.com/SquireGames/Questia-Engine.git
-    BRANCH 09b69bd
+    COMMIT de885c2
     VERSION_MAJOR 0
     VERSION_MINOR 0
 )
