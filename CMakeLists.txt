@@ -1,5 +1,4 @@
-
-cmake_minimum_required (VERSION 2.8.10)
+cmake_minimum_required (VERSION 3.8.2)
 enable_language(C CXX)
 
 # cmake module directory
@@ -17,18 +16,19 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 project(Questia)
 set(QUESTIA_VERSION_MAJOR "0")
 set(QUESTIA_VERSION_MINOR "0")
-set(QUESTIA_VERSION_PATCH "0")
+set(QUESTIA_VERSION_PATCH "1")
 set(QUESTIA_VERSION ${QUESTIA_VERSION_MAJOR}.${QUESTIA_VERSION_MINOR}.${QUESTIA_VERSION_PATCH})
 set(QUESTIA_SOVERSION ${QUESTIA_VERSION_MAJOR}.${QUESTIA_VERSION_MINOR})
-
-## prevent in source builds and wrong settings
-include(safeguards)
 
 ## set static/shared and release/debug options
 include(buildConfiguration)
 
-## get all dependencies
-include(engineDownload)
+## get dependencies
+include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
+conan_basic_setup(KEEP_RPATHS)
+
+## define helper functions to help with linking
+include(qengMacros)
 
 ## define project include directories
 include_directories(
@@ -42,11 +42,10 @@ add_subdirectory(include)
 add_subdirectory(src)
 ## generate documentation
 add_subdirectory(doc)
-## run tests
-# disabled with shared libraries, gtest does not like to be dynamically linked on UNIX
-# bases systems with pthreads
-if(NOT BUILD_SHARED_LIBS OR WIN32)
-    ## needs to be called from top directory
+
+## testing
+option(QST_BUILD_TESTS OFF)
+if(QST_BUILD_TESTS)
     enable_testing()
     add_subdirectory(test)
 endif()
