@@ -1,9 +1,10 @@
-#include "QENG/Engine.h"
+#include "QENG/ClientEngine.h"
 
 #include <iostream>
 
 int main(int argc, char** argv)
 {
-    doNothing();
+    qe::ClientEngine engine;
+    engine.run();
     return 0;
 }
