@@ -6,7 +6,8 @@ edition = "2018"
 
 [dependencies]
 gfx = "0.18.2"
-gfx-hal = "0.5.3"
-gfx-backend-vulkan = "0.5"
+gfx-hal = "0.6.0"
+gfx-auxil = "0.5.0"
+gfx-backend-vulkan = "0.6.1"
 winit = "0.22.2"
 shaderc = "0.6.2"

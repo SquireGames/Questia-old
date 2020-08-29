@@ -1,36 +1,23 @@
 extern crate gfx_backend_vulkan as backend;
 
-use gfx_hal::queue::family::QueueFamily;
-use gfx_hal::window::Surface;
-use gfx_hal::window::PresentationSurface;
+use gfx_hal::{format, image, Instance};
 
-use gfx_hal::Instance;
 use gfx_hal::adapter::PhysicalDevice;
-use gfx_hal::device::Device;
-use gfx_hal::format;
-use gfx_hal::image;
 use gfx_hal::command::Level;
-use gfx_hal::pass::{
-    Attachment,
-    AttachmentOps,
-    AttachmentLoadOp,
-    AttachmentStoreOp,
-    SubpassDesc,
-};
-use gfx_hal::window::Extent2D;
+use gfx_hal::device::Device;
+use gfx_hal::queue::family::QueueFamily;
 
-use winit::{
-    event_loop::{EventLoop},
-    window::WindowBuilder,
-};
+use gfx_hal::pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc};
 
-use gfx_hal::pool::{
-    CommandPool,
-    CommandPoolCreateFlags,
-};
+use gfx_hal::window::{Extent2D, PresentationSurface, Surface};
+
+use gfx_hal::pool::CommandPool;
+
+use winit::{event_loop::EventLoop, window::WindowBuilder};
 
 use shaderc::ShaderKind;
 
+use std::mem;
 use std::mem::ManuallyDrop;
 
 struct Resources<B: gfx_hal::Backend> {
@@ -43,6 +30,10 @@ struct Resources<B: gfx_hal::Backend> {
     command_pool: B::CommandPool,
     submission_complete_fence: B::Fence,
     rendering_complete_semaphore: B::Semaphore,
+}
+
+struct Vertex {
+    pos: [f32; 2],
 }
 
 struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
@@ -81,18 +72,21 @@ impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
 }
 
 fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
     let mut compiler = shaderc::Compiler::new().unwrap();
     let mut options = shaderc::CompileOptions::new().unwrap();
     options.add_macro_definition("EP", Some("main"));
-    let mut compiled_file = compiler.compile_into_spirv(
-        glsl, shader_kind, "shader.glsl", "main", Some(&options)).unwrap();
+    let compiled_file = compiler
+        .compile_into_spirv(glsl, shader_kind, "shader.glsl", "main", Some(&options))
+        .unwrap();
 
-    let mut compiled_file = compiled_file.as_binary_u8();
+    let compiled_file = compiled_file.as_binary_u8();
 
-    let spiv = gfx_hal::pso::read_spirv(Cursor::new(&compiled_file)).expect("Invalid spirv read");
-    spiv
+    let spv =
+        gfx_auxil::read_spirv(Cursor::new(&compiled_file)).expect("Failed to read spirv file");
+
+    spv
 }
 
 unsafe fn make_pipeline<B: gfx_hal::Backend>(
@@ -102,11 +96,12 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     vertex_shader: &str,
     fragment_shader: &str,
 ) -> B::GraphicsPipeline {
-    use gfx_hal::pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
-        GraphicsShaderSet, Primitive, Rasterizer, Specialization
-    };
     use gfx_hal::pass::Subpass;
+    use gfx_hal::pso::{
+        AttributeDesc, BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face,
+        GraphicsPipelineDesc, InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer,
+        Specialization, VertexBufferDesc, VertexInputRate,
+    };
 
     let vertex_shader_module = device
         .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
@@ -129,21 +124,32 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
         },
     );
 
-    let shader_entries = GraphicsShaderSet {
-        vertex: vs_entry,
-        hull: None,
-        domain: None,
-        geometry: None,
-        fragment: Some(fs_entry),   
+    let vertex_buffers = vec![VertexBufferDesc {
+        binding: 0,
+        stride: mem::size_of::<Vertex>() as u32,
+        rate: VertexInputRate::Vertex,
+    }];
+    let attributes: Vec<AttributeDesc> = vec![];
+    let input_assembler = InputAssemblerDesc {
+        primitive: Primitive::TriangleList,
+        with_adjacency: false,
+        restart_index: None,
     };
 
     let mut pipeline_desc = GraphicsPipelineDesc::new(
-        shader_entries,
-        Primitive::TriangleList,
+        PrimitiveAssemblerDesc::Vertex {
+            buffers: &vertex_buffers,
+            attributes: &attributes,
+            input_assembler: input_assembler,
+            vertex: vs_entry,
+            tessellation: None,
+            geometry: None,
+        },
         Rasterizer {
             cull_face: Face::BACK,
             ..Rasterizer::FILL
         },
+        Some(fs_entry),
         pipeline_layout,
         Subpass {
             index: 0,
@@ -151,9 +157,23 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
         },
     );
 
+    // let mut pipeline_desc = GraphicsPipelineDesc::new(
+    //     shader_entries,
+    //     Primitive::TriangleList,
+    //     Rasterizer {
+    //         cull_face: Face::BACK,
+    //         ..Rasterizer::FILL
+    //     },
+    //     pipeline_layout,
+    //     Subpass {
+    //         index: 0,
+    //         main_pass: render_pass,
+    //     },
+    // );
+
     pipeline_desc.blender.targets.push(ColorBlendDesc {
         mask: ColorMask::ALL,
-        blend: Some(BlendState::ALPHA)
+        blend: Some(BlendState::ALPHA),
     });
 
     let pipeline = device
@@ -166,7 +186,6 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     pipeline
 }
 
-
 fn main() {
     let event_loop = EventLoop::new();
     let window_builder = WindowBuilder::new().with_title("Questia Game");
@@ -175,12 +194,12 @@ fn main() {
 
     let window = window_builder.build(&event_loop).unwrap();
 
-    let mut surface = unsafe {
+    let surface = unsafe {
         gfx_instance
             .create_surface(&window)
             .expect("Failed to create surface")
     };
-    let mut adapter = gfx_instance.enumerate_adapters().remove(0);
+    let adapter = gfx_instance.enumerate_adapters().remove(0);
 
     let family = adapter
         .queue_families
@@ -201,13 +220,14 @@ fn main() {
     let device = gpu.device;
 
     let mut command_pool = unsafe {
-        device.create_command_pool(queue_group.family, gfx_hal::pool::CommandPoolCreateFlags::empty())
+        device.create_command_pool(
+            queue_group.family,
+            gfx_hal::pool::CommandPoolCreateFlags::empty(),
+        )
     }
     .expect("Can't create command pool");
 
-    let mut command_buffer = unsafe {
-        command_pool.allocate_one(Level::Primary)
-    };
+    let mut command_buffer = unsafe { command_pool.allocate_one(Level::Primary) };
 
     let formats = surface.supported_formats(&adapter.physical_device);
     let format = formats.map_or(format::Format::Rgba8Srgb, |formats| {
@@ -220,24 +240,21 @@ fn main() {
 
     let render_pass = {
         let color_attachment = Attachment {
-          format: Some(format),
-          samples: 1,
-          ops: AttachmentOps::new(
-              AttachmentLoadOp::Clear, 
-              AttachmentStoreOp::Store,
-            ),
-          stencil_ops: AttachmentOps::DONT_CARE,
-          layouts: image::Layout::Undefined .. image::Layout::Present,
+            format: Some(format),
+            samples: 1,
+            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
+            stencil_ops: AttachmentOps::DONT_CARE,
+            layouts: image::Layout::Undefined..image::Layout::Present,
         };
 
         let subpass = SubpassDesc {
-          colors: &[(0, image::Layout::ColorAttachmentOptimal)],
-          depth_stencil: None,
-          inputs: &[],
-          resolves: &[],
-          preserves: &[],
+            colors: &[(0, image::Layout::ColorAttachmentOptimal)],
+            depth_stencil: None,
+            inputs: &[],
+            resolves: &[],
+            preserves: &[],
         };
-        
+
         unsafe {
             device
                 .create_render_pass(&[color_attachment], &[subpass], &[])
@@ -251,7 +268,7 @@ fn main() {
             .expect("Out of memory")
     };
 
-    let vertex_shader = include_str!("../shaders/simple.vert"); 
+    let vertex_shader = include_str!("../shaders/simple.vert");
     let fragment_shader = include_str!("../shaders/simple.frag");
 
     let pipeline = unsafe {
@@ -267,7 +284,7 @@ fn main() {
     let submission_complete_fence = device.create_fence(true).expect("Out of memory");
     let rendering_complete_semaphore = device.create_semaphore().expect("Out of memory");
 
-    let mut resource_holder: ResourceHolder<backend::Backend> = 
+    let mut resource_holder: ResourceHolder<backend::Backend> =
         ResourceHolder(ManuallyDrop::new(Resources {
             instance: gfx_instance,
             surface,
@@ -278,7 +295,7 @@ fn main() {
             pipelines: vec![pipeline],
             submission_complete_fence,
             rendering_complete_semaphore,
-    }));
+        }));
 
     let mut should_configure_swapchain = true;
 
@@ -314,19 +331,23 @@ fn main() {
 
                         res.command_pool.reset(false);
                     }
-                    let mut extent = Extent2D{width: 100, height: 100};
+                    let mut extent = Extent2D {
+                        width: 100,
+                        height: 100,
+                    };
 
                     if should_configure_swapchain {
                         use gfx_hal::window::SwapchainConfig;
 
                         let caps = res.surface.capabilities(&adapter.physical_device);
-                        
-                        let mut swapchain_config = SwapchainConfig::from_caps(&caps, format, extent);
+
+                        let mut swapchain_config =
+                            SwapchainConfig::from_caps(&caps, format, extent);
 
                         if caps.image_count.contains(&3) {
                             swapchain_config.image_count = 3;
                         }
-                        
+
                         extent = swapchain_config.extent;
 
                         unsafe {
@@ -351,11 +372,10 @@ fn main() {
                     };
 
                     let framebuffer = unsafe {
-                        use std::borrow::Borrow;
                         use gfx_hal::image::Extent;
+                        use std::borrow::Borrow;
 
-                        res
-                            .device
+                        res.device
                             .create_framebuffer(
                                 render_pass,
                                 vec![surface_image.borrow()],
@@ -383,7 +403,8 @@ fn main() {
 
                     unsafe {
                         use gfx_hal::command::{
-                            ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, SubpassContents,
+                            ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
+                            SubpassContents,
                         };
 
                         command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
@@ -397,7 +418,7 @@ fn main() {
                             &[ClearValue {
                                 color: ClearColor {
                                     float32: [0.0, 0.0, 0.0, 0.0],
-                                }
+                                },
                             }],
                             SubpassContents::Inline,
                         );
@@ -416,14 +437,15 @@ fn main() {
                             signal_semaphores: vec![&res.rendering_complete_semaphore],
                         };
 
-                        queue_group.queues[0].submit(submission, Some(&res.submission_complete_fence));
-                        let result = queue_group.queues[0].present_surface(
+                        queue_group.queues[0]
+                            .submit(submission, Some(&res.submission_complete_fence));
+                        let result = queue_group.queues[0].present(
                             &mut res.surface,
                             surface_image,
                             Some(&res.rendering_complete_semaphore),
                         );
 
-                        should_configure_swapchain |=  result.is_err();
+                        should_configure_swapchain |= result.is_err();
                         res.device.destroy_framebuffer(framebuffer);
                     }
                 }
