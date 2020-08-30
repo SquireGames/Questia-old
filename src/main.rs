@@ -32,6 +32,16 @@ struct Resources<B: gfx_hal::Backend> {
     rendering_complete_semaphore: B::Semaphore,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PushConstants {
+    color: [f32; 4],
+    pos: [f32; 2],
+    scale: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct Vertex {
     pos: [f32; 2],
 }
@@ -157,20 +167,6 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
         },
     );
 
-    // let mut pipeline_desc = GraphicsPipelineDesc::new(
-    //     shader_entries,
-    //     Primitive::TriangleList,
-    //     Rasterizer {
-    //         cull_face: Face::BACK,
-    //         ..Rasterizer::FILL
-    //     },
-    //     pipeline_layout,
-    //     Subpass {
-    //         index: 0,
-    //         main_pass: render_pass,
-    //     },
-    // );
-
     pipeline_desc.blender.targets.push(ColorBlendDesc {
         mask: ColorMask::ALL,
         blend: Some(BlendState::ALPHA),
@@ -188,7 +184,12 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
 
 fn main() {
     let event_loop = EventLoop::new();
-    let window_builder = WindowBuilder::new().with_title("Questia Game");
+    let window_builder = WindowBuilder::new()
+        .with_title("Questia Game")
+        .with_inner_size(winit::dpi::LogicalSize {
+            width: 500,
+            height: 500,
+        });
     let gfx_instance =
         backend::Instance::create("name", 1).expect("Failed to create graphics instance");
 
@@ -262,9 +263,11 @@ fn main() {
         }
     };
 
+    use gfx_hal::pso::ShaderStageFlags;
+    let push_constant_bytes = std::mem::size_of::<PushConstants>() as u32;
     let pipeline_layout = unsafe {
         device
-            .create_pipeline_layout(&[], &[])
+            .create_pipeline_layout(&[], &[(ShaderStageFlags::VERTEX, 0..push_constant_bytes)])
             .expect("Out of memory")
     };
 
@@ -299,9 +302,9 @@ fn main() {
 
     let mut should_configure_swapchain = true;
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = winit::event_loop::ControlFlow::Wait;
+    let start_time = std::time::Instant::now();
 
+    event_loop.run(move |event, _, control_flow| {
         match event {
             winit::event::Event::WindowEvent { event, .. } => match event {
                 winit::event::WindowEvent::CloseRequested => {
@@ -312,145 +315,177 @@ fn main() {
                 }
                 _ => {}
             },
+            winit::event::Event::MainEventsCleared => window.request_redraw(),
             winit::event::Event::RedrawRequested(_) => {
                 let res: &mut Resources<_> = &mut resource_holder.0;
                 let render_pass = &res.render_passes[0];
+                let pipeline_layout = &res.pipeline_layouts[0];
                 let pipeline = &res.pipelines[0];
-                {
-                    unsafe {
-                        // one second timeout
-                        let render_timeout_ns = 1_000_000_000;
 
-                        res.device
-                            .wait_for_fence(&res.submission_complete_fence, render_timeout_ns)
-                            .expect("Out of memory or device lost");
+                unsafe {
+                    // one second timeout
+                    let render_timeout_ns = 1_000_000_000;
 
-                        res.device
-                            .reset_fence(&res.submission_complete_fence)
-                            .expect("Out of memory");
+                    res.device
+                        .wait_for_fence(&res.submission_complete_fence, render_timeout_ns)
+                        .expect("Out of memory or device lost");
 
-                        res.command_pool.reset(false);
-                    }
-                    let mut extent = Extent2D {
-                        width: 100,
-                        height: 100,
-                    };
+                    res.device
+                        .reset_fence(&res.submission_complete_fence)
+                        .expect("Out of memory");
 
-                    if should_configure_swapchain {
-                        use gfx_hal::window::SwapchainConfig;
+                    res.command_pool.reset(false);
+                }
 
-                        let caps = res.surface.capabilities(&adapter.physical_device);
+                let mut extent = Extent2D {
+                    width: 500,
+                    height: 500,
+                };
 
-                        let mut swapchain_config =
-                            SwapchainConfig::from_caps(&caps, format, extent);
+                if should_configure_swapchain {
+                    use gfx_hal::window::SwapchainConfig;
 
-                        if caps.image_count.contains(&3) {
-                            swapchain_config.image_count = 3;
-                        }
+                    let caps = res.surface.capabilities(&adapter.physical_device);
 
-                        extent = swapchain_config.extent;
+                    let mut swapchain_config = SwapchainConfig::from_caps(&caps, format, extent);
 
-                        unsafe {
-                            res.surface
-                                .configure_swapchain(&res.device, swapchain_config)
-                                .expect("Failed to configure swapchain");
-                        }
-
-                        should_configure_swapchain = false;
+                    if caps.image_count.contains(&3) {
+                        swapchain_config.image_count = 3;
                     }
 
-                    let surface_image = unsafe {
-                        let acquire_timeout_ns = 1_000_000_000;
-
-                        match res.surface.acquire_image(acquire_timeout_ns) {
-                            Ok((image, _)) => image,
-                            Err(_) => {
-                                should_configure_swapchain = true;
-                                return;
-                            }
-                        }
-                    };
-
-                    let framebuffer = unsafe {
-                        use gfx_hal::image::Extent;
-                        use std::borrow::Borrow;
-
-                        res.device
-                            .create_framebuffer(
-                                render_pass,
-                                vec![surface_image.borrow()],
-                                Extent {
-                                    width: extent.width,
-                                    height: extent.height,
-                                    depth: 1,
-                                },
-                            )
-                            .unwrap()
-                    };
-
-                    let viewport = {
-                        use gfx_hal::pso::{Rect, Viewport};
-                        Viewport {
-                            rect: Rect {
-                                x: 0,
-                                y: 0,
-                                w: extent.width as i16,
-                                h: extent.height as i16,
-                            },
-                            depth: 0.0..1.0,
-                        }
-                    };
+                    extent = swapchain_config.extent;
 
                     unsafe {
-                        use gfx_hal::command::{
-                            ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
-                            SubpassContents,
-                        };
+                        res.surface
+                            .configure_swapchain(&res.device, swapchain_config)
+                            .expect("Failed to configure swapchain");
+                    }
 
-                        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+                    should_configure_swapchain = false;
+                }
 
-                        command_buffer.set_viewports(0, &[viewport.clone()]);
-                        command_buffer.set_scissors(0, &[viewport.rect]);
-                        command_buffer.begin_render_pass(
+                let surface_image = unsafe {
+                    let acquire_timeout_ns = 1_000_000_000;
+
+                    match res.surface.acquire_image(acquire_timeout_ns) {
+                        Ok((image, _)) => image,
+                        Err(_) => {
+                            should_configure_swapchain = true;
+                            return;
+                        }
+                    }
+                };
+
+                let framebuffer = unsafe {
+                    use gfx_hal::image::Extent;
+                    use std::borrow::Borrow;
+
+                    res.device
+                        .create_framebuffer(
                             render_pass,
-                            &framebuffer,
-                            viewport.rect,
-                            &[ClearValue {
-                                color: ClearColor {
-                                    float32: [0.0, 0.0, 0.0, 0.0],
-                                },
-                            }],
-                            SubpassContents::Inline,
+                            vec![surface_image.borrow()],
+                            Extent {
+                                width: extent.width,
+                                height: extent.height,
+                                depth: 1,
+                            },
+                        )
+                        .unwrap()
+                };
+
+                let viewport = {
+                    use gfx_hal::pso::{Rect, Viewport};
+                    Viewport {
+                        rect: Rect {
+                            x: 0,
+                            y: 0,
+                            w: extent.width as i16,
+                            h: extent.height as i16,
+                        },
+                        depth: 0.0..1.0,
+                    }
+                };
+
+                let anim = start_time.elapsed().as_secs_f32().sin() * 0.5 + 0.5;
+                let triangles = &[
+                    PushConstants {
+                        color: [0.5, 1.0, 0.4, 1.0],
+                        pos: [-0.1, anim],
+                        scale: [1.0, 1.0],
+                    },
+                    PushConstants {
+                        color: [0.0, anim, 1.0, 1.0],
+                        pos: [0.1, -0.5],
+                        scale: [anim, anim],
+                    },
+                ];
+
+                unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
+                    let size_in_bytes = std::mem::size_of::<T>();
+                    let size_in_u32s = size_in_bytes / std::mem::size_of::<u32>();
+                    let start_ptr = push_constants as *const T as *const u32;
+                    std::slice::from_raw_parts(start_ptr, size_in_u32s)
+                }
+
+                unsafe {
+                    use gfx_hal::command::{
+                        ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, SubpassContents,
+                    };
+
+                    command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+
+                    command_buffer.set_viewports(0, &[viewport.clone()]);
+                    command_buffer.set_scissors(0, &[viewport.rect]);
+                    command_buffer.begin_render_pass(
+                        render_pass,
+                        &framebuffer,
+                        viewport.rect,
+                        &[ClearValue {
+                            color: ClearColor {
+                                float32: [0.0, 0.0, 0.0, 0.0],
+                            },
+                        }],
+                        SubpassContents::Inline,
+                    );
+                    command_buffer.bind_graphics_pipeline(pipeline);
+
+                    for triangle in triangles {
+                        command_buffer.push_graphics_constants(
+                            pipeline_layout,
+                            ShaderStageFlags::VERTEX,
+                            0,
+                            push_constant_bytes(triangle),
                         );
-                        command_buffer.bind_graphics_pipeline(pipeline);
+
                         command_buffer.draw(0..3, 0..1);
-                        command_buffer.end_render_pass();
-                        command_buffer.finish();
                     }
 
-                    unsafe {
-                        use gfx_hal::queue::{CommandQueue, Submission};
+                    command_buffer.end_render_pass();
+                    command_buffer.finish();
+                }
 
-                        let submission = Submission {
-                            command_buffers: vec![&command_buffer],
-                            wait_semaphores: None,
-                            signal_semaphores: vec![&res.rendering_complete_semaphore],
-                        };
+                unsafe {
+                    use gfx_hal::queue::{CommandQueue, Submission};
 
-                        queue_group.queues[0]
-                            .submit(submission, Some(&res.submission_complete_fence));
-                        let result = queue_group.queues[0].present(
-                            &mut res.surface,
-                            surface_image,
-                            Some(&res.rendering_complete_semaphore),
-                        );
+                    let submission = Submission {
+                        command_buffers: vec![&command_buffer],
+                        wait_semaphores: None,
+                        signal_semaphores: vec![&res.rendering_complete_semaphore],
+                    };
 
-                        should_configure_swapchain |= result.is_err();
-                        res.device.destroy_framebuffer(framebuffer);
-                    }
+                    queue_group.queues[0].submit(submission, Some(&res.submission_complete_fence));
+
+                    let result = queue_group.queues[0].present(
+                        &mut res.surface,
+                        surface_image,
+                        Some(&res.rendering_complete_semaphore),
+                    );
+
+                    should_configure_swapchain |= result.is_err();
+                    res.device.destroy_framebuffer(framebuffer);
                 }
             }
             _ => {}
         }
-    })
+    });
 }
