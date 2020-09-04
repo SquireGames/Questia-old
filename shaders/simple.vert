@@ -1,24 +1,15 @@
 #version 450
 
 layout(push_constant) uniform PushConstants {
-    vec4 color;
-    vec2 pos;
-    vec2 scale;
+    mat4 transform;
 } push_constants;
+
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
 
 layout(location = 0) out vec4 vertex_color;
 
 void main() {
-    vec2 position;
-    if(gl_VertexIndex == 0) {
-        position = vec2(0.0, -0.5);
-    } else if (gl_VertexIndex == 1) {
-        position = vec2(-0.5, 0.5);
-    } else if (gl_VertexIndex == 2) {
-        position = vec2(0.5, 0.5);
-    }
-
-    vec2 pos = position * push_constants.scale;
-    vertex_color = push_constants.color;
-    gl_Position = vec4(pos + push_constants.pos, 0.0, 1.0); 
+    vertex_color = vec4(abs(normal), 1.0);
+    gl_Position = push_constants.transform * vec4(position, 1.0);
 }
