@@ -1,277 +1,61 @@
 extern crate gfx_backend_vulkan as backend;
 
-use gfx_hal::{format, image, Instance};
+mod graphics;
+mod math;
 
-use gfx_hal::adapter::PhysicalDevice;
-use gfx_hal::command::Level;
-use gfx_hal::device::Device;
-use gfx_hal::queue::family::QueueFamily;
-
-use gfx_hal::pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc};
-
-use gfx_hal::window::{Extent2D, PresentationSurface, Surface};
-
-use gfx_hal::pool::CommandPool;
-
-use winit::{event_loop::EventLoop, window::WindowBuilder};
-
-use shaderc::ShaderKind;
-
+use gfx_hal::{
+    adapter::PhysicalDevice,
+    command::Level,
+    device::Device,
+    format, image,
+    pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc},
+    pool::CommandPool,
+    queue::{family::QueueFamily, CommandQueue, Submission},
+    window::{Extent2D, PresentationSurface, Surface},
+    Instance,
+};
 use std::mem::ManuallyDrop;
-
-struct Resources<B: gfx_hal::Backend> {
-    instance: B::Instance,
-    surface: B::Surface,
-    device: B::Device,
-    render_passes: Vec<B::RenderPass>,
-    pipeline_layouts: Vec<B::PipelineLayout>,
-    pipelines: Vec<B::GraphicsPipeline>,
-    command_pool: B::CommandPool,
-    submission_complete_fence: B::Fence,
-    rendering_complete_semaphore: B::Semaphore,
-    vertex_buffer_memory: B::Memory,
-    vertex_buffer: B::Buffer,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct PushConstants {
-    transform: [[f32; 4]; 4],
-}
-
-#[repr(C)]
-#[derive(serde::Deserialize)]
-struct Vertex {
-    pos: [f32; 3],
-    normal: [f32; 3],
-}
-
-fn make_tranform(translate: [f32; 3], angle: f32, scale: f32) -> [[f32; 4]; 4] {
-    let c = angle.cos() * scale;
-    let s = angle.sin() * scale;
-    let [dx, dy, dz] = translate;
-    [
-        [c, 0., s, 0.],
-        [0., scale, 0., 0.],
-        [-s, 0., c, 0.],
-        [dx, dy, dz, 1.],
-    ]
-}
-
-unsafe fn make_buffer<B: gfx_hal::Backend>(
-    device: &B::Device,
-    physical_device: &B::PhysicalDevice,
-    buffer_len: usize,
-    usage: gfx_hal::buffer::Usage,
-    properties: gfx_hal::memory::Properties,
-) -> (B::Memory, B::Buffer) {
-    let mut buffer = device
-        .create_buffer(buffer_len as u64, usage)
-        .expect("Failed to create buffer");
-
-    let requirements = device.get_buffer_requirements(&buffer);
-
-    let memory_types = physical_device.memory_properties().memory_types;
-
-    let memory_type = memory_types
-        .iter()
-        .enumerate()
-        .find(|(id, mem_type)| {
-            let type_supported = requirements.type_mask & (1_u32 << id) != 0;
-            type_supported && mem_type.properties.contains(properties)
-        })
-        .map(|(id, _type)| gfx_hal::MemoryTypeId(id))
-        .expect("No compatible memory type");
-
-    let buffer_memory = device
-        .allocate_memory(memory_type, requirements.size)
-        .expect("Failed to allocate memory");
-
-    device
-        .bind_buffer_memory(&buffer_memory, 0, &mut buffer)
-        .expect("tast");
-
-    (buffer_memory, buffer)
-}
-
-struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
-
-impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
-    fn drop(&mut self) {
-        unsafe {
-            let Resources {
-                instance,
-                mut surface,
-                device,
-                command_pool,
-                render_passes,
-                pipeline_layouts,
-                pipelines,
-                submission_complete_fence,
-                rendering_complete_semaphore,
-                vertex_buffer_memory,
-                vertex_buffer,
-            } = ManuallyDrop::take(&mut self.0);
-
-            device.free_memory(vertex_buffer_memory);
-            device.destroy_buffer(vertex_buffer);
-            device.destroy_semaphore(rendering_complete_semaphore);
-            device.destroy_fence(submission_complete_fence);
-            for pipeline in pipelines {
-                device.destroy_graphics_pipeline(pipeline);
-            }
-            for pipeline_layout in pipeline_layouts {
-                device.destroy_pipeline_layout(pipeline_layout);
-            }
-            for render_pass in render_passes {
-                device.destroy_render_pass(render_pass);
-            }
-            device.destroy_command_pool(command_pool);
-            surface.unconfigure_swapchain(&device);
-            instance.destroy_surface(surface);
-        }
-    }
-}
-
-fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
-    use std::io::Cursor;
-
-    let mut compiler = shaderc::Compiler::new().unwrap();
-    let mut options = shaderc::CompileOptions::new().unwrap();
-    options.add_macro_definition("EP", Some("main"));
-    let compiled_file = compiler
-        .compile_into_spirv(glsl, shader_kind, "shader.glsl", "main", Some(&options))
-        .unwrap();
-
-    let compiled_file = compiled_file.as_binary_u8();
-
-    let spv =
-        gfx_auxil::read_spirv(Cursor::new(&compiled_file)).expect("Failed to read spirv file");
-
-    spv
-}
-
-unsafe fn make_pipeline<B: gfx_hal::Backend>(
-    device: &B::Device,
-    render_pass: &B::RenderPass,
-    pipeline_layout: &B::PipelineLayout,
-    vertex_shader: &str,
-    fragment_shader: &str,
-) -> B::GraphicsPipeline {
-    use gfx_hal::format::Format;
-    use gfx_hal::pass::Subpass;
-    use gfx_hal::pso::{
-        AttributeDesc, BlendState, ColorBlendDesc, ColorMask, Element, EntryPoint, Face,
-        GraphicsPipelineDesc, InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer,
-        Specialization, VertexBufferDesc, VertexInputRate,
-    };
-
-    let vertex_shader_module = device
-        .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
-        .expect("Failed to create vertex module");
-
-    let fragment_shader_module = device
-        .create_shader_module(&compile_shader(fragment_shader, ShaderKind::Fragment))
-        .expect("Failed to create fragment shader");
-
-    let (vs_entry, fs_entry) = (
-        EntryPoint {
-            entry: "main",
-            module: &vertex_shader_module,
-            specialization: Specialization::default(),
-        },
-        EntryPoint {
-            entry: "main",
-            module: &fragment_shader_module,
-            specialization: Specialization::default(),
-        },
-    );
-
-    let vertex_buffers = vec![VertexBufferDesc {
-        binding: 0,
-        stride: std::mem::size_of::<Vertex>() as u32,
-        rate: VertexInputRate::Vertex,
-    }];
-
-    let attributes: Vec<AttributeDesc> = vec![
-        AttributeDesc {
-            location: 0,
-            binding: 0,
-            element: Element {
-                format: Format::Rgb32Sfloat,
-                offset: 0,
-            },
-        },
-        AttributeDesc {
-            location: 1,
-            binding: 0,
-            element: Element {
-                format: Format::Rgb32Sfloat,
-                offset: 12,
-            },
-        },
-    ];
-    let input_assembler = InputAssemblerDesc {
-        primitive: Primitive::TriangleList,
-        with_adjacency: false,
-        restart_index: None,
-    };
-
-    let mut pipeline_desc = GraphicsPipelineDesc::new(
-        PrimitiveAssemblerDesc::Vertex {
-            buffers: &vertex_buffers,
-            attributes: &attributes,
-            input_assembler: input_assembler,
-            vertex: vs_entry,
-            tessellation: None,
-            geometry: None,
-        },
-        Rasterizer {
-            cull_face: Face::BACK,
-            ..Rasterizer::FILL
-        },
-        Some(fs_entry),
-        pipeline_layout,
-        Subpass {
-            index: 0,
-            main_pass: render_pass,
-        },
-    );
-
-    pipeline_desc.blender.targets.push(ColorBlendDesc {
-        mask: ColorMask::ALL,
-        blend: Some(BlendState::ALPHA),
-    });
-
-    let pipeline = device
-        .create_graphics_pipeline(&pipeline_desc, None)
-        .expect("Failed to create graphics pipeline");
-
-    device.destroy_shader_module(vertex_shader_module);
-    device.destroy_shader_module(fragment_shader_module);
-
-    pipeline
-}
+use winit::{
+    dpi::{LogicalSize, PhysicalSize},
+    event_loop::EventLoop,
+    window::WindowBuilder,
+};
 
 fn main() {
+    const DEFAULT_WINDOW_SIZE: [u32; 2] = [1000, 1000];
+
+    // winit creation
+    // winit has a concept of physical vs logical window size for different dpi screens
     let event_loop = EventLoop::new();
+    let (physical_window_size, logical_window_size) = {
+        let dpi = event_loop.primary_monitor().unwrap().scale_factor();
+        let logical_size: LogicalSize<u32> = DEFAULT_WINDOW_SIZE.into();
+        let physical_size: PhysicalSize<u32> = logical_size.to_physical(dpi);
+        (physical_size, logical_size)
+    };
     let window_builder = WindowBuilder::new()
         .with_title("Questia Game")
-        .with_inner_size(winit::dpi::LogicalSize {
-            width: 500,
-            height: 500,
-        });
-    let gfx_instance =
-        backend::Instance::create("name", 1).expect("Failed to create graphics instance");
-
+        .with_inner_size(logical_window_size);
     let window = window_builder.build(&event_loop).unwrap();
-
-    let surface = unsafe {
-        gfx_instance
-            .create_surface(&window)
-            .expect("Failed to create surface")
+    let mut window_render_size = Extent2D {
+        width: physical_window_size.width,
+        height: physical_window_size.height,
     };
-    let adapter = gfx_instance.enumerate_adapters().remove(0);
+
+    // gfx instance creation
+    let (gfx_instance, surface, adapter) = {
+        let gfx_instance =
+            backend::Instance::create("name", 1).expect("Failed to create graphics instance");
+
+        let surface = unsafe {
+            gfx_instance
+                .create_surface(&window)
+                .expect("Failed to create surface")
+        };
+        let adapter = gfx_instance.enumerate_adapters().remove(0);
+
+        (gfx_instance, surface, adapter)
+    };
 
     let family = adapter
         .queue_families
@@ -301,22 +85,25 @@ fn main() {
 
     let mut command_buffer = unsafe { command_pool.allocate_one(Level::Primary) };
 
-    let formats = surface.supported_formats(&adapter.physical_device);
-    let format = formats.map_or(format::Format::Rgba8Srgb, |formats| {
-        formats
-            .iter()
-            .find(|format| format.base_format().1 == format::ChannelType::Srgb)
-            .map(|format| *format)
-            .unwrap_or(formats[0])
-    });
+    let surface_color_format = {
+        let formats = surface.supported_formats(&adapter.physical_device);
+        let format = formats.map_or(format::Format::Rgba8Srgb, |formats| {
+            formats
+                .iter()
+                .find(|format| format.base_format().1 == format::ChannelType::Srgb)
+                .map(|format| *format)
+                .unwrap_or(formats[0])
+        });
+        format
+    };
 
     let binary_mesh_data = include_bytes!("../assets/teapot_mesh.bin");
-    let mesh: Vec<Vertex> =
+    let mesh: Vec<graphics::Vertex> =
         bincode::deserialize(binary_mesh_data).expect("Failed to deserialize mesh");
 
-    let vertex_buffer_len = mesh.len() * std::mem::size_of::<Vertex>();
+    let vertex_buffer_len = mesh.len() * std::mem::size_of::<graphics::Vertex>();
     let (vertex_buffer_memory, vertex_buffer) = unsafe {
-        make_buffer::<backend::Backend>(
+        graphics::make_buffer::<backend::Backend>(
             &device,
             &adapter.physical_device,
             vertex_buffer_len,
@@ -344,7 +131,7 @@ fn main() {
 
     let render_pass = {
         let color_attachment = Attachment {
-            format: Some(format),
+            format: Some(surface_color_format),
             samples: 1,
             ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
             stencil_ops: AttachmentOps::DONT_CARE,
@@ -367,7 +154,7 @@ fn main() {
     };
 
     use gfx_hal::pso::ShaderStageFlags;
-    let push_constant_bytes = std::mem::size_of::<PushConstants>() as u32;
+    let push_constant_bytes = std::mem::size_of::<graphics::PushConstants>() as u32;
     let pipeline_layout = unsafe {
         device
             .create_pipeline_layout(&[], &[(ShaderStageFlags::VERTEX, 0..push_constant_bytes)])
@@ -378,7 +165,7 @@ fn main() {
     let fragment_shader = include_str!("../shaders/simple.frag");
 
     let pipeline = unsafe {
-        make_pipeline::<backend::Backend>(
+        graphics::make_pipeline::<backend::Backend>(
             &device,
             &render_pass,
             &pipeline_layout,
@@ -390,8 +177,8 @@ fn main() {
     let submission_complete_fence = device.create_fence(true).expect("Out of memory");
     let rendering_complete_semaphore = device.create_semaphore().expect("Out of memory");
 
-    let mut resource_holder: ResourceHolder<backend::Backend> =
-        ResourceHolder(ManuallyDrop::new(Resources {
+    let mut resource_holder: graphics::resources::ResourceHolder<backend::Backend> =
+        graphics::resources::ResourceHolder(ManuallyDrop::new(graphics::resources::Resources {
             instance: gfx_instance,
             surface,
             device,
@@ -415,14 +202,19 @@ fn main() {
                 winit::event::WindowEvent::CloseRequested => {
                     *control_flow = winit::event_loop::ControlFlow::Exit
                 }
-                winit::event::WindowEvent::Resized(_) => {
+                winit::event::WindowEvent::Resized(new_render_size) => {
+                    window_render_size = Extent2D {
+                        width: new_render_size.width,
+                        height: new_render_size.height,
+                    };
+
                     should_configure_swapchain = true;
                 }
                 _ => {}
             },
             winit::event::Event::MainEventsCleared => window.request_redraw(),
             winit::event::Event::RedrawRequested(_) => {
-                let res: &mut Resources<_> = &mut resource_holder.0;
+                let res: &mut graphics::resources::Resources<_> = &mut resource_holder.0;
                 let render_pass = &res.render_passes[0];
                 let pipeline_layout = &res.pipeline_layouts[0];
                 let pipeline = &res.pipelines[0];
@@ -442,23 +234,19 @@ fn main() {
                     res.command_pool.reset(false);
                 }
 
-                let mut extent = Extent2D {
-                    width: 500,
-                    height: 500,
-                };
-
                 if should_configure_swapchain {
                     use gfx_hal::window::SwapchainConfig;
 
                     let caps = res.surface.capabilities(&adapter.physical_device);
 
-                    let mut swapchain_config = SwapchainConfig::from_caps(&caps, format, extent);
+                    let mut swapchain_config =
+                        SwapchainConfig::from_caps(&caps, surface_color_format, window_render_size);
 
                     if caps.image_count.contains(&3) {
                         swapchain_config.image_count = 3;
                     }
 
-                    extent = swapchain_config.extent;
+                    window_render_size = swapchain_config.extent;
 
                     unsafe {
                         res.surface
@@ -490,8 +278,8 @@ fn main() {
                             render_pass,
                             vec![surface_image.borrow()],
                             Extent {
-                                width: extent.width,
-                                height: extent.height,
+                                width: window_render_size.width,
+                                height: window_render_size.height,
                                 depth: 1,
                             },
                         )
@@ -504,16 +292,16 @@ fn main() {
                         rect: Rect {
                             x: 0,
                             y: 0,
-                            w: extent.width as i16,
-                            h: extent.height as i16,
+                            w: window_render_size.width as i16,
+                            h: window_render_size.height as i16,
                         },
                         depth: 0.0..1.0,
                     }
                 };
 
                 let angle = start_time.elapsed().as_secs_f32();
-                let transforms = &[PushConstants {
-                    transform: make_tranform([0., 0., 0.5], angle, 1.0),
+                let transforms = &[graphics::PushConstants {
+                    transform: math::graphics::make_tranform([0., 0., 0.5], angle, 1.0),
                 }];
 
                 unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
@@ -568,8 +356,6 @@ fn main() {
                 }
 
                 unsafe {
-                    use gfx_hal::queue::{CommandQueue, Submission};
-
                     let submission = Submission {
                         command_buffers: vec![&command_buffer],
                         wait_semaphores: None,
